@@ -23,9 +23,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 
 	consts "github.com/bishopfox/sliver/client/constants"
@@ -98,7 +96,7 @@ func handleSliverConnection(conn net.Conn) {
 		}()
 		handlers := serverHandlers.GetHandlers()
 		for {
-			envelope, err := socketReadEnvelope(conn)
+			envelope, release, err := socketReadEnvelope(conn)
 			if err != nil {
 				mtlsLog.Errorf("Socket read error %v", err)
 				return
@@ -110,14 +108,18 @@ func handleSliverConnection(conn net.Conn) {
 					resp <- envelope // Could deadlock, maybe want to investigate better solutions
 				}
 				implantConn.RespMutex.RUnlock()
+				release()
 			} else if handler, ok := handlers[envelope.Type]; ok {
 				mtlsLog.Debugf("Received new mtls message type %d, data: %s", envelope.Type, envelope.Data)
-				go func() {
-					respEnvelope := handler(implantConn, envelope.Data)
+				go func(data []byte, release func()) {
+					defer release()
+					respEnvelope := handler(implantConn, data)
 					if respEnvelope != nil {
 						implantConn.Send <- respEnvelope
 					}
-				}()
+				}(envelope.Data, release)
+			} else {
+				release()
 			}
 		}
 	}()
@@ -147,6 +149,10 @@ func socketWriteEnvelope(connection net.Conn, envelope *sliverpb.Envelope) error
 		mtlsLog.Errorf("Envelope marshaling error: %v", err)
 		return err
 	}
+	if err := validateC2EnvelopeLength(uint64(len(data))); err != nil {
+		mtlsLog.Errorf("Envelope length error: %v", err)
+		return err
+	}
 	dataLengthBuf := new(bytes.Buffer)
 	binary.Write(dataLengthBuf, binary.LittleEndian, uint32(len(data)))
 	connection.Write(dataLengthBuf.Bytes())
@@ -156,39 +162,8 @@ func socketWriteEnvelope(connection net.Conn, envelope *sliverpb.Envelope) error
 
 // socketReadEnvelope - Reads a message from the TLS connection using length prefix framing
 // returns messageType, message, and error
-func socketReadEnvelope(connection net.Conn) (*sliverpb.Envelope, error) {
-	// Read the first four bytes to determine data length
-	dataLengthBuf := make([]byte, 4) // Size of uint32
-	n, err := io.ReadFull(connection, dataLengthBuf)
-
-	if err != nil || n != 4 {
-		mtlsLog.Errorf("Socket error (read msg-length): %v", err)
-		return nil, err
-	}
-	dataLength := int(binary.LittleEndian.Uint32(dataLengthBuf))
-	if dataLength <= 0 {
-		// {{if .Config.Debug}}
-		mtlsLog.Printf("[pivot] read error: %s\n", err)
-		// {{end}}
-		return nil, errors.New("[pivot] zero data length")
-	}
-
-	dataBuf := make([]byte, dataLength)
-
-	n, err = io.ReadFull(connection, dataBuf)
-
-	if err != nil || n != dataLength {
-		mtlsLog.Errorf("Socket error (read data): %v", err)
-		return nil, err
-	}
-	// Unmarshal the protobuf envelope
-	envelope := &sliverpb.Envelope{}
-	err = proto.Unmarshal(dataBuf, envelope)
-	if err != nil {
-		mtlsLog.Errorf("Un-marshaling envelope error: %v", err)
-		return nil, err
-	}
-	return envelope, nil
+func socketReadEnvelope(connection net.Conn) (*sliverpb.Envelope, func(), error) {
+	return readC2Envelope(connection, c2EnvelopeBudget)
 }
 
 // getServerTLSConfig - Generate the TLS configuration, we do now allow the end user

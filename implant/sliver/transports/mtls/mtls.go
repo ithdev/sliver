@@ -25,9 +25,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	// {{if .Config.Debug}}
@@ -37,6 +35,7 @@ import (
 	"os"
 
 	"github.com/bishopfox/sliver/implant/sliver/cryptography"
+	"github.com/bishopfox/sliver/implant/sliver/netframe"
 	pb "github.com/bishopfox/sliver/protobuf/sliverpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -62,6 +61,9 @@ func WriteEnvelope(connection *tls.Conn, envelope *pb.Envelope) error {
 		log.Print("Envelope marshaling error: ", err)
 		// {{end}}
 		return err
+	}
+	if err := netframe.ValidateLength(uint64(len(data))); err != nil {
+		return fmt.Errorf("[mtls] write envelope: %w", err)
 	}
 	dataLengthBuf := new(bytes.Buffer)
 	binary.Write(dataLengthBuf, binary.LittleEndian, uint32(len(data)))
@@ -97,35 +99,15 @@ func WritePing(connection *tls.Conn) error {
 
 // ReadEnvelope - Reads a message from the TLS connection using length prefix framing
 func ReadEnvelope(connection *tls.Conn) (*pb.Envelope, error) {
-	dataLengthBuf := make([]byte, 4) // Size of uint32
-	if len(dataLengthBuf) == 0 || connection == nil {
+	if connection == nil {
 		panic("[[GenerateCanary]]")
 	}
-	n, err := io.ReadFull(connection, dataLengthBuf)
-	if err != nil || n != 4 {
+	dataBuf, err := netframe.Read(connection)
+	if err != nil {
 		// {{if .Config.Debug}}
-		log.Printf("Socket error (read msg-length): %v\n", err)
+		log.Printf("[mtls] read error: %s\n", err)
 		// {{end}}
-		return nil, err
-	}
-	dataLength := int(binary.LittleEndian.Uint32(dataLengthBuf))
-
-	if dataLength <= 0 {
-		// {{if .Config.Debug}}
-		log.Printf("[pivot] read error: %s\n", err)
-		// {{end}}
-		return nil, errors.New("[mtls] zero data length")
-	}
-
-	dataBuf := make([]byte, dataLength)
-
-	n, err = io.ReadFull(connection, dataBuf)
-
-	if err != nil || n != dataLength {
-		// {{if .Config.Debug}}
-		log.Printf("Read error: %s\n", err)
-		// {{end}}
-		return nil, err
+		return nil, fmt.Errorf("[mtls] read envelope: %w", err)
 	}
 
 	// Unmarshal the protobuf envelope

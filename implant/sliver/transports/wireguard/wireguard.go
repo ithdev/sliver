@@ -41,6 +41,7 @@ import (
 
 	pb "github.com/bishopfox/sliver/protobuf/sliverpb"
 
+	"github.com/bishopfox/sliver/implant/sliver/netframe"
 	"github.com/bishopfox/sliver/implant/sliver/netstack"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -87,6 +88,9 @@ func WriteEnvelope(connection net.Conn, envelope *pb.Envelope) error {
 		// {{end}}
 		return err
 	}
+	if err := netframe.ValidateLength(uint64(len(data))); err != nil {
+		return fmt.Errorf("[wireguard] write envelope: %w", err)
+	}
 	dataLengthBuf := new(bytes.Buffer)
 	binary.Write(dataLengthBuf, binary.LittleEndian, uint32(len(data)))
 	if _, werr := connection.Write(dataLengthBuf.Bytes()); werr != nil {
@@ -121,35 +125,15 @@ func WritePing(connection net.Conn) error {
 
 // ReadEnvelope - Reads a message from the wireguard connection using length prefix framing
 func ReadEnvelope(connection net.Conn) (*pb.Envelope, error) {
-	dataLengthBuf := make([]byte, 4) // Size of uint32
-	if len(dataLengthBuf) == 0 || connection == nil {
+	if connection == nil {
 		panic("[[GenerateCanary]]")
 	}
-	n, err := io.ReadFull(connection, dataLengthBuf)
-	if err != nil || n != 4 {
+	dataBuf, err := netframe.Read(connection)
+	if err != nil {
 		// {{if .Config.Debug}}
-		log.Printf("Socket error (read msg-length): %v\n", err)
+		log.Printf("[wireguard] read error: %s\n", err)
 		// {{end}}
-		return nil, err
-	}
-	dataLength := int(binary.LittleEndian.Uint32(dataLengthBuf))
-
-	if dataLength <= 0 {
-		// {{if .Config.Debug}}
-		log.Printf("[pivot] read error: %s\n", err)
-		// {{end}}
-		return nil, errors.New("[wireguard] zero data length")
-	}
-
-	dataBuf := make([]byte, dataLength)
-
-	n, err = io.ReadFull(connection, dataBuf)
-
-	if err != nil || n != dataLength {
-		// {{if .Config.Debug}}
-		log.Printf("Read error: %s\n", err)
-		// {{end}}
-		return nil, err
+		return nil, fmt.Errorf("[wireguard] read envelope: %w", err)
 	}
 
 	// Unmarshal the protobuf envelope

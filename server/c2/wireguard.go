@@ -22,9 +22,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 
@@ -218,7 +216,7 @@ func handleWGSliverConnection(conn net.Conn) {
 		}()
 		handlers := serverHandlers.GetHandlers()
 		for {
-			envelope, err := socketWGReadEnvelope(conn)
+			envelope, release, err := socketWGReadEnvelope(conn)
 			if err != nil {
 				wgLog.Errorf("Socket read error %s", err)
 				return
@@ -230,13 +228,17 @@ func handleWGSliverConnection(conn net.Conn) {
 					resp <- envelope // Could deadlock, maybe want to investigate better solutions
 				}
 				implantConn.RespMutex.RUnlock()
+				release()
 			} else if handler, ok := handlers[envelope.Type]; ok {
-				go func() {
-					respEnvelope := handler(implantConn, envelope.Data)
+				go func(data []byte, release func()) {
+					defer release()
+					respEnvelope := handler(implantConn, data)
 					if respEnvelope != nil {
 						implantConn.Send <- respEnvelope
 					}
-				}()
+				}(envelope.Data, release)
+			} else {
+				release()
 			}
 		}
 	}()
@@ -266,6 +268,10 @@ func socketWGWriteEnvelope(connection net.Conn, envelope *sliverpb.Envelope) err
 		wgLog.Errorf("Envelope marshaling error: %v", err)
 		return err
 	}
+	if err := validateC2EnvelopeLength(uint64(len(data))); err != nil {
+		wgLog.Errorf("Envelope length error: %v", err)
+		return err
+	}
 	dataLengthBuf := new(bytes.Buffer)
 	binary.Write(dataLengthBuf, binary.LittleEndian, uint32(len(data)))
 	connection.Write(dataLengthBuf.Bytes())
@@ -275,40 +281,6 @@ func socketWGWriteEnvelope(connection net.Conn, envelope *sliverpb.Envelope) err
 
 // socketWGReadEnvelope - Reads a message from the wireguard connection using length prefix framing
 // returns messageType, message, and error
-func socketWGReadEnvelope(connection net.Conn) (*sliverpb.Envelope, error) {
-
-	// Read the first four bytes to determine data length
-	dataLengthBuf := make([]byte, 4) // Size of uint32
-
-	n, err := io.ReadFull(connection, dataLengthBuf)
-
-	if err != nil || n != 4 {
-		wgLog.Errorf("Socket error (read msg-length): %v", err)
-		return nil, err
-	}
-	dataLength := int(binary.LittleEndian.Uint32(dataLengthBuf))
-
-	if dataLength <= 0 {
-		// {{if .Config.Debug}}
-		wgLog.Errorf("[wireguard] read error: %s\n", err)
-		// {{end}}
-		return nil, errors.New("[wireguard] zero data length")
-	}
-
-	dataBuf := make([]byte, dataLength)
-
-	n, err = io.ReadFull(connection, dataBuf)
-
-	if err != nil || n != dataLength {
-		wgLog.Errorf("Socket error (read data): %v", err)
-		return nil, err
-	}
-	// Unmarshal the protobuf envelope
-	envelope := &sliverpb.Envelope{}
-	err = proto.Unmarshal(dataBuf, envelope)
-	if err != nil {
-		wgLog.Errorf("Un-marshaling envelope error: %v", err)
-		return nil, err
-	}
-	return envelope, nil
+func socketWGReadEnvelope(connection net.Conn) (*sliverpb.Envelope, func(), error) {
+	return readC2Envelope(connection, c2EnvelopeBudget)
 }

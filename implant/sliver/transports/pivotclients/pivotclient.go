@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -33,6 +32,7 @@ import (
 
 	consts "github.com/bishopfox/sliver/implant/sliver/constants"
 	"github.com/bishopfox/sliver/implant/sliver/cryptography"
+	"github.com/bishopfox/sliver/implant/sliver/netframe"
 	"github.com/bishopfox/sliver/implant/sliver/pivots"
 	pb "github.com/bishopfox/sliver/protobuf/sliverpb"
 	"github.com/gofrs/uuid"
@@ -197,6 +197,9 @@ func (p *NetConnPivotClient) serverKeyExchange() error {
 func (p *NetConnPivotClient) write(message []byte) error {
 	p.writeMutex.Lock()
 	defer p.writeMutex.Unlock()
+	if err := netframe.ValidateLength(uint64(len(message))); err != nil {
+		return err
+	}
 	n, err := p.conn.Write(p.lengthOf(message))
 	if err != nil {
 		// {{if .Config.Debug}}
@@ -228,36 +231,14 @@ func (p *NetConnPivotClient) write(message []byte) error {
 func (p *NetConnPivotClient) read() ([]byte, error) {
 	p.readMutex.Lock()
 	defer p.readMutex.Unlock()
-	dataLengthBuf := make([]byte, 4)
-
-	n, err := io.ReadFull(p.conn, dataLengthBuf)
-
-	if err != nil || n != 4 {
+	data, err := netframe.Read(p.conn)
+	if err != nil {
 		// {{if .Config.Debug}}
-		log.Printf("[pivot] Error (read msg-length): %v\n", err)
+		log.Printf("[pivot] read error: %v\n", err)
 		// {{end}}
 		return nil, err
 	}
-
-	dataLength := int(binary.LittleEndian.Uint32(dataLengthBuf))
-	if dataLength <= 0 {
-		// {{if .Config.Debug}}
-		log.Printf("[pivot] read error: %s\n", err)
-		// {{end}}
-		return nil, errors.New("[pivot] zero data length")
-	}
-
-	dataBuf := make([]byte, dataLength)
-
-	n, err = io.ReadFull(p.conn, dataBuf)
-
-	if err != nil || n != dataLength {
-		// {{if .Config.Debug}}
-		log.Printf("read error: %s\n", err)
-		// {{end}}
-		return nil, err
-	}
-	return dataBuf, err
+	return data, nil
 }
 
 func (p *NetConnPivotClient) lengthOf(message []byte) []byte {
