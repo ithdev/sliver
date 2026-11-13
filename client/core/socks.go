@@ -31,6 +31,7 @@ import (
 	"github.com/bishopfox/sliver/protobuf/rpcpb"
 	"github.com/bishopfox/sliver/protobuf/sliverpb"
 	"github.com/bishopfox/sliver/util/leaky"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -39,9 +40,35 @@ var (
 		tcpProxies: map[uint64]*SocksProxy{},
 		mutex:      &sync.RWMutex{},
 	}
-	SocksConnPool = sync.Map{}
-	SocksProxyID  = (uint64)(0)
+	SocksProxyID = (uint64)(0)
 )
+
+type SocksProxyStream interface {
+	Send(*sliverpb.SocksData) error
+	Recv() (*sliverpb.SocksData, error)
+	CloseSend() error
+}
+
+type SocksRPCClient interface {
+	CreateSocks(context.Context, *sliverpb.Socks, ...grpc.CallOption) (*sliverpb.Socks, error)
+	SocksProxy(context.Context, ...grpc.CallOption) (SocksProxyStream, error)
+}
+
+type sliverSocksRPCClient struct {
+	client rpcpb.SliverRPCClient
+}
+
+func NewSocksRPCClient(client rpcpb.SliverRPCClient) SocksRPCClient {
+	return &sliverSocksRPCClient{client: client}
+}
+
+func (rpc *sliverSocksRPCClient) CreateSocks(ctx context.Context, request *sliverpb.Socks, opts ...grpc.CallOption) (*sliverpb.Socks, error) {
+	return rpc.client.CreateSocks(ctx, request, opts...)
+}
+
+func (rpc *sliverSocksRPCClient) SocksProxy(ctx context.Context, opts ...grpc.CallOption) (SocksProxyStream, error) {
+	return rpc.client.SocksProxy(ctx, opts...)
+}
 
 // PortfwdMeta - Metadata about a portfwd listener
 type SocksProxyMeta struct {
@@ -52,7 +79,7 @@ type SocksProxyMeta struct {
 	Password  string
 }
 type TcpProxy struct {
-	Rpc     rpcpb.SliverRPCClient
+	Rpc     SocksRPCClient
 	Session *clientpb.Session
 
 	Username        string
@@ -61,21 +88,75 @@ type TcpProxy struct {
 	Listener        net.Listener
 	KeepAlivePeriod time.Duration
 	DialTimeout     time.Duration
+
+	connectionsMutex  sync.Mutex
+	connectionsClosed bool
+	connections       map[uint64]net.Conn
+	cancelMutex       sync.Mutex
+	cancel            context.CancelFunc
 }
 
 func (tcp *TcpProxy) Stop() error {
+	tcp.cancelMutex.Lock()
+	cancel := tcp.cancel
+	tcp.cancel = nil
+	tcp.cancelMutex.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
 	err := tcp.Listener.Close()
 
-	// Closing all connections in pool
-	SocksConnPool.Range(func(key, value interface{}) bool {
-		con := value.(net.Conn)
+	tcp.connectionsMutex.Lock()
+	tcp.connectionsClosed = true
+	connections := tcp.connections
+	tcp.connections = nil
+	tcp.connectionsMutex.Unlock()
 
-		con.Close()
-
-		return err == nil
-	})
+	for _, conn := range connections {
+		conn.Close()
+	}
 
 	return err
+}
+
+func (tcp *TcpProxy) setCancel(cancel context.CancelFunc) {
+	tcp.cancelMutex.Lock()
+	defer tcp.cancelMutex.Unlock()
+	tcp.cancel = cancel
+}
+
+func (tcp *TcpProxy) trackConnection(tunnelID uint64, conn net.Conn) bool {
+	tcp.connectionsMutex.Lock()
+	defer tcp.connectionsMutex.Unlock()
+	if tcp.connectionsClosed {
+		conn.Close()
+		return false
+	}
+	if tcp.connections == nil {
+		tcp.connections = map[uint64]net.Conn{}
+	}
+	tcp.connections[tunnelID] = conn
+	return true
+}
+
+func (tcp *TcpProxy) getConnection(tunnelID uint64) (net.Conn, bool) {
+	tcp.connectionsMutex.Lock()
+	defer tcp.connectionsMutex.Unlock()
+	conn, ok := tcp.connections[tunnelID]
+	return conn, ok
+}
+
+func (tcp *TcpProxy) closeConnection(tunnelID uint64) {
+	tcp.connectionsMutex.Lock()
+	conn, ok := tcp.connections[tunnelID]
+	if ok {
+		delete(tcp.connections, tunnelID)
+	}
+	tcp.connectionsMutex.Unlock()
+	if ok {
+		conn.Close()
+	}
 }
 
 // SocksProxy - Tracks portfwd<->tcpproxy
@@ -114,65 +195,87 @@ func (f *socksProxy) Add(tcpProxy *TcpProxy) *SocksProxy {
 	return Sockser
 }
 
-func (f *socksProxy) Start(tcpProxy *TcpProxy) error {
+func (f *socksProxy) Start(socks *SocksProxy) error {
+	tcpProxy := socks.ChannelProxy
 	ctx, cancel := context.WithCancel(context.Background())
-	proxy, err := tcpProxy.Rpc.SocksProxy(ctx)
-	defer cancel()
+	tcpProxy.setCancel(cancel)
+	defer func() {
+		cancel()
+		tcpProxy.Stop()
+		f.unregister(socks.ID)
+		log.Printf("Socks Stop -> %s\n", tcpProxy.BindAddr)
+	}()
 
+	proxy, err := tcpProxy.Rpc.SocksProxy(ctx)
 	if err != nil {
 		return err
 	}
+
+	receiverDone := make(chan struct{})
 	go func() {
+		defer close(receiverDone)
+		fromImplantSequence := 0
 		for {
-			FromImplantSequence := 0
 			socksData, err := proxy.Recv()
 			if err != nil {
 				log.Printf("Failed to Recv from proxy, %s\n", err)
+				tcpProxy.Stop()
 				return
 			}
 
-			if v, ok := SocksConnPool.Load(socksData.TunnelID); ok {
-				conn := v.(net.Conn)
-
+			if conn, ok := tcpProxy.getConnection(socksData.TunnelID); ok {
 				if socksData.CloseConn {
-					conn.Close()
-					SocksConnPool.Delete(socksData.TunnelID)
+					tcpProxy.closeConnection(socksData.TunnelID)
 					continue
 				}
-				log.Printf("[socks] agent to Server To (Client to User) Data Sequence %d , Data Size %d \n", FromImplantSequence, len(socksData.Data))
+				log.Printf("[socks] agent to Server To (Client to User) Data Sequence %d , Data Size %d \n", fromImplantSequence, len(socksData.Data))
 				//fmt.Printf("recv data len %d \n", len(p.Data))
 				_, err := conn.Write(socksData.Data)
 				if err != nil {
 					log.Printf("Failed to write data to proxy connection, %s\n", err)
+					tcpProxy.closeConnection(socksData.TunnelID)
 					continue
 				}
-				FromImplantSequence++
+				fromImplantSequence++
 			}
 		}
 	}()
+
+	var connectionHandlers sync.WaitGroup
 	for {
 		connection, err := tcpProxy.Listener.Accept()
 		if err != nil {
 			log.Printf("Failed to accept new listener, probably already closed: %s\n", err)
 			break
 		}
-		rpcSocks, err := tcpProxy.Rpc.CreateSocks(context.Background(), &sliverpb.Socks{
+		rpcSocks, err := tcpProxy.Rpc.CreateSocks(ctx, &sliverpb.Socks{
 			SessionID: tcpProxy.Session.ID,
 		})
 		if err != nil {
 			log.Printf("Failed rcp call to create socks %s\n", err)
+			connection.Close()
 			break
 		}
 
-		go connect(connection, proxy, &sliverpb.SocksData{
+		frame := &sliverpb.SocksData{
 			Username: tcpProxy.Username,
 			Password: tcpProxy.Password,
 			TunnelID: rpcSocks.TunnelID,
 			Request:  &commonpb.Request{SessionID: rpcSocks.SessionID},
-		})
+		}
+		if !tcpProxy.trackConnection(frame.TunnelID, connection) {
+			break
+		}
+		connectionHandlers.Add(1)
+		go func(conn net.Conn, frame *sliverpb.SocksData) {
+			defer connectionHandlers.Done()
+			connect(conn, proxy, tcpProxy, frame)
+		}(connection, frame)
 	}
-	log.Printf("Socks Stop -> %s\n", tcpProxy.BindAddr)
-	tcpProxy.Stop() // well, at this moment we already in stop state, but anyway
+	cancel()
+	tcpProxy.Stop()
+	<-receiverDone
+	connectionHandlers.Wait()
 	proxy.CloseSend()
 	return nil
 }
@@ -180,14 +283,22 @@ func (f *socksProxy) Start(tcpProxy *TcpProxy) error {
 // Remove - Remove a TCP proxy instance
 func (f *socksProxy) Remove(socksId uint64) bool {
 	f.mutex.Lock()
-	defer f.mutex.Unlock()
-
-	if _, ok := f.tcpProxies[socksId]; ok {
-		f.tcpProxies[socksId].ChannelProxy.Stop()
+	socks, ok := f.tcpProxies[socksId]
+	if ok {
 		delete(f.tcpProxies, socksId)
-		return true
 	}
-	return false
+	f.mutex.Unlock()
+
+	if ok {
+		socks.ChannelProxy.Stop()
+	}
+	return ok
+}
+
+func (f *socksProxy) unregister(socksID uint64) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	delete(f.tcpProxies, socksID)
 }
 
 // List - List all TCP proxy instances
@@ -209,19 +320,11 @@ const leakyBufSize = 4108 // data.len(2) + hmacsha1(10) + data(4096)
 
 var leakyBuf = leaky.NewLeakyBuf(2048, leakyBufSize)
 
-func connect(conn net.Conn, stream rpcpb.SliverRPC_SocksProxyClient, frame *sliverpb.SocksData) {
-
-	SocksConnPool.Store(frame.TunnelID, conn)
+func connect(conn net.Conn, stream SocksProxyStream, proxy *TcpProxy, frame *sliverpb.SocksData) {
 
 	defer func() {
 		// It's neccessary to close and remove connection once we done with it
-		c, ok := SocksConnPool.LoadAndDelete(frame.TunnelID)
-		if !ok {
-			return
-		}
-		conn := c.(net.Conn)
-
-		conn.Close()
+		proxy.closeConnection(frame.TunnelID)
 
 		log.Printf("[socks] connection closed")
 	}()

@@ -66,7 +66,7 @@ func SocksStartCmd(ctx *grumble.Context, con *console.SliverConsoleClient) {
 	}
 
 	channelProxy := &core.TcpProxy{
-		Rpc:             con.Rpc,
+		Rpc:             core.NewSocksRPCClient(con.Rpc),
 		Session:         session,
 		Listener:        ln,
 		BindAddr:        bindAddr,
@@ -76,9 +76,9 @@ func SocksStartCmd(ctx *grumble.Context, con *console.SliverConsoleClient) {
 		DialTimeout:     30 * time.Second,
 	}
 
-	go func(channelProxy *core.TcpProxy) {
-		core.SocksProxies.Start(channelProxy)
-	}(core.SocksProxies.Add(channelProxy).ChannelProxy)
+	go func(socks *core.SocksProxy) {
+		core.SocksProxies.Start(socks)
+	}(core.SocksProxies.Add(channelProxy))
 	con.PrintInfof("Started SOCKS5 %s %s %s %s\n", host, port, username, password)
 	con.PrintWarnf("In-band SOCKS proxies can be a little unstable depending on protocol\n")
 }
