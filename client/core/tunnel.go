@@ -20,28 +20,92 @@ package core
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
+	"time"
 
 	"github.com/bishopfox/sliver/protobuf/rpcpb"
 )
 
-// TunnelLoop - Parses incoming tunnel messages and distributes them
-//              to session/tunnel objects
-// 				Expected to be called only once during initialization
-func TunnelLoop(rpc rpcpb.SliverRPCClient) error {
-	log.Println("Starting tunnel data loop ...")
-	defer log.Printf("Warning: TunnelLoop exited")
+const (
+	initialTunnelReconnectDelay = time.Second
+	maxTunnelReconnectDelay     = 30 * time.Second
+)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := rpc.TunnelData(ctx)
+type tunnelDataStreamFactory func(context.Context) (rpcpb.SliverRPC_TunnelDataClient, error)
+
+// TunnelLoop - Parses incoming tunnel messages and distributes them
+//
+//	to session/tunnel objects
+//	Expected to be called only once during initialization
+func TunnelLoop(rpc rpcpb.SliverRPCClient) error {
+	return tunnelLoop(
+		context.Background(),
+		func(ctx context.Context) (rpcpb.SliverRPC_TunnelDataClient, error) {
+			return rpc.TunnelData(ctx)
+		},
+		GetTunnels(),
+		initialTunnelReconnectDelay,
+		maxTunnelReconnectDelay,
+	)
+}
+
+func tunnelLoop(
+	ctx context.Context,
+	openStream tunnelDataStreamFactory,
+	tunnels *tunnels,
+	initialDelay time.Duration,
+	maxDelay time.Duration,
+) error {
+	log.Println("Starting tunnel data loop ...")
+	delay := initialDelay
+
+	for {
+		err := tunnelStreamLoop(ctx, openStream, tunnels, func() {
+			delay = initialDelay
+		})
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("Tunnel data stream ended: %s; reconnecting in %s", err, delay)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+}
+
+func tunnelStreamLoop(
+	ctx context.Context,
+	openStream tunnelDataStreamFactory,
+	tunnels *tunnels,
+	onConnected func(),
+) error {
+	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	stream, err := openStream(streamCtx)
 	if err != nil {
 		return err
 	}
+	if onConnected != nil {
+		onConnected()
+	}
+	defer stream.CloseSend()
+	defer tunnels.ClearStream(stream)
+	defer tunnels.Reset()
 
-	GetTunnels().SetStream(stream)
+	tunnels.SetStream(stream)
 
 	for {
 		log.Printf("Waiting for TunnelData ...")
@@ -50,15 +114,13 @@ func TunnelLoop(rpc rpcpb.SliverRPCClient) error {
 		log.Printf("Recv stream err: %s", err)
 
 		if err == io.EOF {
-			log.Printf("EOF Error: Tunnel data stream closed")
-			return nil
+			return errors.New("tunnel data stream closed")
 		}
 		if err != nil {
-			log.Printf("Tunnel data read error: %s", err)
 			return err
 		}
 		log.Printf("Received TunnelData for tunnel %d", incoming.TunnelID)
-		tunnel := GetTunnels().Get(incoming.TunnelID)
+		tunnel := tunnels.Get(incoming.TunnelID)
 
 		if tunnel != nil {
 			data := incoming.GetData()
@@ -74,7 +136,7 @@ func TunnelLoop(rpc rpcpb.SliverRPCClient) error {
 				}
 			} else {
 				log.Printf("Closing tunnel %d", tunnel.ID)
-				GetTunnels().Close(tunnel.ID)
+				tunnels.Close(tunnel.ID)
 			}
 		} else {
 			log.Printf("Received tunnel data for non-existent tunnel id %d", incoming.TunnelID)

@@ -70,6 +70,15 @@ func (t *tunnels) SetStream(stream rpcpb.SliverRPC_TunnelDataClient) {
 	t.stream = stream
 }
 
+func (t *tunnels) ClearStream(stream rpcpb.SliverRPC_TunnelDataClient) {
+	t.streamMutex.Lock()
+	defer t.streamMutex.Unlock()
+
+	if t.stream == stream {
+		t.stream = nil
+	}
+}
+
 // Get - Get a tunnel
 func (t *tunnels) Get(tunnelID uint64) *TunnelIO {
 	t.mutex.RLock()
@@ -142,6 +151,17 @@ func (t *tunnels) Close(tunnelID uint64) {
 		tunnel.Close()
 
 		delete((*t.tunnels), tunnelID)
+	}
+}
+
+func (t *tunnels) Reset() {
+	t.mutex.Lock()
+	tunnels := *t.tunnels
+	*t.tunnels = map[uint64]*TunnelIO{}
+	t.mutex.Unlock()
+
+	for _, tunnel := range tunnels {
+		tunnel.Close()
 	}
 }
 
