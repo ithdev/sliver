@@ -156,12 +156,14 @@ func (t *tunnels) ScheduleClose(tunnelID uint64) {
 // It's preferred to use ScheduleClose function if you don't 100% sure there is no more data to receive
 func (t *tunnels) Close(tunnelID uint64) error {
 	t.mutex.Lock()
-	defer t.mutex.Unlock()
-
 	tunnel := t.tunnels[tunnelID]
 	if tunnel == nil {
+		t.mutex.Unlock()
 		return ErrInvalidTunnelID
 	}
+	delete(t.tunnels, tunnelID)
+	t.mutex.Unlock()
+
 	tunnelClose, err := proto.Marshal(&sliverpb.TunnelData{
 		TunnelID:  tunnel.ID,
 		SessionID: tunnel.SessionID,
@@ -177,8 +179,14 @@ func (t *tunnels) Close(tunnelID uint64) error {
 	if err != nil {
 		return err
 	}
-	tunnel.ToImplant <- data // Send an in-band close to implant
-	delete(t.tunnels, tunnelID)
+
+	// A dead client stream may leave no consumer on ToImplant. Do not block
+	// tunnel creation and lookup behind the registry mutex in that case.
+	select {
+	case tunnel.ToImplant <- data:
+	default:
+	}
+
 	close(tunnel.ToImplant)
 	close(tunnel.FromImplant)
 	return nil
