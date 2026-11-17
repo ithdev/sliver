@@ -241,27 +241,32 @@ func getActiveTarget(rawRequest []byte) (*clientpb.Session, *clientpb.Beacon, er
 		return nil, nil, nil
 	}
 
-	rpcRequest := request["Request"].(map[string]interface{})
+	rpcRequest, ok := request["Request"].(map[string]interface{})
+	if !ok {
+		return nil, nil, nil
+	}
 
 	middlewareLog.Debugf("RPC Request: %v", rpcRequest)
 
 	if rawBeaconID, ok := rpcRequest["BeaconID"]; ok {
-		beaconID := rawBeaconID.(string)
-		middlewareLog.Debugf("Found Beacon ID: %s", beaconID)
-		beacon, err := db.BeaconByID(beaconID)
-		if err != nil {
-			middlewareLog.Errorf("Failed to get beacon %s: %s", beaconID, err)
-		} else if beacon != nil {
-			activeBeacon = beacon.ToProtobuf()
+		if beaconID, ok := rawBeaconID.(string); ok {
+			middlewareLog.Debugf("Found Beacon ID: %s", beaconID)
+			beacon, err := db.BeaconByID(beaconID)
+			if err != nil {
+				middlewareLog.Errorf("Failed to get beacon %s: %s", beaconID, err)
+			} else if beacon != nil {
+				activeBeacon = beacon.ToProtobuf()
+			}
 		}
 	}
 
 	if rawSessionID, ok := rpcRequest["SessionID"]; ok {
-		sessionID := rawSessionID.(string)
-		middlewareLog.Debugf("Found Session ID: %s", sessionID)
-		session := core.Sessions.Get(sessionID)
-		if session != nil {
-			activeSession = session.ToProtobuf()
+		if sessionID, ok := rawSessionID.(string); ok {
+			middlewareLog.Debugf("Found Session ID: %s", sessionID)
+			session := core.Sessions.Get(sessionID)
+			if session != nil {
+				activeSession = session.ToProtobuf()
+			}
 		}
 	}
 
