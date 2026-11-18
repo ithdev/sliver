@@ -37,11 +37,15 @@ type TcpTunnel struct {
 	ID                uint64
 	SessionID         string
 	ToImplantSequence uint64
-	ToImplantMux      sync.Mutex
 
 	FromImplant         chan *sliverpb.SocksData
 	FromImplantSequence uint64
 	Client              rpcpb.SliverRPC_SocksProxyServer
+
+	mutex    sync.RWMutex
+	done     chan struct{}
+	doneOnce sync.Once
+	closed   bool
 }
 
 type tcpTunnel struct {
@@ -57,6 +61,7 @@ func (t *tcpTunnel) Create(sessionID string) *TcpTunnel {
 		SessionID: session.ID,
 		//ToImplant:   make(chan []byte),
 		FromImplant: make(chan *sliverpb.SocksData),
+		done:        make(chan struct{}),
 	}
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
@@ -66,17 +71,87 @@ func (t *tcpTunnel) Create(sessionID string) *TcpTunnel {
 }
 
 func (t *tcpTunnel) Close(tunnelID uint64) error {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
+	return t.closeTunnel(tunnelID, nil)
+}
 
+// CloseTunnel closes tunnel only if it is still the registered instance for
+// its ID. A worker from an older tunnel must not remove a replacement.
+func (t *tcpTunnel) CloseTunnel(tunnel *TcpTunnel) error {
+	return t.closeTunnel(tunnel.ID, tunnel)
+}
+
+func (t *tcpTunnel) closeTunnel(tunnelID uint64, expected *TcpTunnel) error {
+	t.mutex.Lock()
 	tunnel := t.tunnels[tunnelID]
-	if tunnel == nil {
+	if tunnel == nil || expected != nil && tunnel != expected {
+		t.mutex.Unlock()
 		return ErrInvalidTunnelID
 	}
 	delete(t.tunnels, tunnelID)
+	t.mutex.Unlock()
 	//close(tunnel.ToImplant)
-	close(tunnel.FromImplant)
+	tunnel.close()
 	return nil
+}
+
+func (t *TcpTunnel) Done() <-chan struct{} {
+	return t.done
+}
+
+func (t *TcpTunnel) close() {
+	t.doneOnce.Do(func() {
+		t.mutex.Lock()
+		t.closed = true
+		close(t.done)
+		t.mutex.Unlock()
+	})
+}
+
+func (t *TcpTunnel) BindClient(stream rpcpb.SliverRPC_SocksProxyServer) (newBinding bool, owns bool) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if t.closed {
+		return false, false
+	}
+	if t.Client == nil {
+		t.Client = stream
+		return true, true
+	}
+	return false, t.Client == stream
+}
+
+func (t *TcpTunnel) ClientStream() rpcpb.SliverRPC_SocksProxyServer {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.Client
+}
+
+func (t *TcpTunnel) SendDataFromImplant(tunnelData *sliverpb.SocksData) error {
+	select {
+	case t.FromImplant <- tunnelData:
+		return nil
+	case <-t.done:
+		return ErrTunnelClosed
+	}
+}
+
+func (t *tcpTunnel) CloseForClient(stream rpcpb.SliverRPC_SocksProxyServer) []uint64 {
+	t.mutex.Lock()
+	tunnels := make([]*TcpTunnel, 0)
+	for _, tunnel := range t.tunnels {
+		if tunnel.ClientStream() == stream {
+			tunnels = append(tunnels, tunnel)
+		}
+	}
+	t.mutex.Unlock()
+
+	tunnelIDs := make([]uint64, 0, len(tunnels))
+	for _, tunnel := range tunnels {
+		if t.CloseTunnel(tunnel) == nil {
+			tunnelIDs = append(tunnelIDs, tunnel.ID)
+		}
+	}
+	return tunnelIDs
 }
 
 func (t *tcpTunnel) Get(tunnelID uint64) *TcpTunnel {

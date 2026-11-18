@@ -39,6 +39,9 @@ var (
 
 	// ErrInvalidTunnelID - Invalid tunnel ID value
 	ErrInvalidTunnelID = errors.New("invalid tunnel ID")
+
+	// ErrTunnelClosed - The tunnel lifetime ended before the operation completed
+	ErrTunnelClosed = errors.New("tunnel closed")
 )
 
 const (
@@ -64,6 +67,9 @@ type Tunnel struct {
 
 	mutex               *sync.RWMutex
 	lastDataMessageTime time.Time
+	done                chan struct{}
+	doneOnce            sync.Once
+	closed              bool
 }
 
 func NewTunnel(id uint64, sessionID string) *Tunnel {
@@ -75,7 +81,46 @@ func NewTunnel(id uint64, sessionID string) *Tunnel {
 
 		mutex:               &sync.RWMutex{},
 		lastDataMessageTime: time.Now(), // need to be initialized
+		done:                make(chan struct{}),
 	}
+}
+
+// Done is closed once the tunnel lifetime ends. Data channels remain open so
+// an in-flight sender can select on Done instead of racing with a close.
+func (t *Tunnel) Done() <-chan struct{} {
+	return t.done
+}
+
+func (t *Tunnel) close() {
+	t.doneOnce.Do(func() {
+		t.mutex.Lock()
+		t.closed = true
+		close(t.done)
+		t.mutex.Unlock()
+	})
+}
+
+// BindClient associates a client stream with a tunnel. The first caller binds,
+// and later callers are told whether they own the existing binding.
+func (t *Tunnel) BindClient(stream rpcpb.SliverRPC_TunnelDataServer) (newBinding bool, owns bool) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	if t.closed {
+		return false, false
+	}
+	if t.Client == nil {
+		t.Client = stream
+		return true, true
+	}
+	return false, t.Client == stream
+}
+
+// ClientStream returns the currently bound client stream, if any.
+func (t *Tunnel) ClientStream() rpcpb.SliverRPC_TunnelDataServer {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.Client
 }
 
 func (t *Tunnel) setLastMessageTime() {
@@ -92,12 +137,27 @@ func (t *Tunnel) GetLastMessageTime() time.Time {
 	return t.lastDataMessageTime
 }
 
-func (t *Tunnel) SendDataFromImplant(tunnelData *sliverpb.TunnelData) {
+func (t *Tunnel) SendDataFromImplant(tunnelData *sliverpb.TunnelData) error {
 	// Setting the date right before and right after message, since channel can be blocked for some amount of time
 	t.setLastMessageTime()
 	defer t.setLastMessageTime()
 
-	t.FromImplant <- tunnelData
+	select {
+	case t.FromImplant <- tunnelData:
+		return nil
+	case <-t.done:
+		return ErrTunnelClosed
+	}
+}
+
+// SendToImplant delivers client data unless the tunnel has already ended.
+func (t *Tunnel) SendToImplant(data []byte) error {
+	select {
+	case t.ToImplant <- data:
+		return nil
+	case <-t.done:
+		return ErrTunnelClosed
+	}
 }
 
 type tunnels struct {
@@ -155,9 +215,19 @@ func (t *tunnels) ScheduleClose(tunnelID uint64) {
 // Close - closing tunnel
 // It's preferred to use ScheduleClose function if you don't 100% sure there is no more data to receive
 func (t *tunnels) Close(tunnelID uint64) error {
+	return t.closeTunnel(tunnelID, nil)
+}
+
+// CloseTunnel closes tunnel only if it is still the registered instance for
+// its ID. A worker from an older tunnel must not remove a replacement.
+func (t *tunnels) CloseTunnel(tunnel *Tunnel) error {
+	return t.closeTunnel(tunnel.ID, tunnel)
+}
+
+func (t *tunnels) closeTunnel(tunnelID uint64, expected *Tunnel) error {
 	t.mutex.Lock()
 	tunnel := t.tunnels[tunnelID]
-	if tunnel == nil {
+	if tunnel == nil || expected != nil && tunnel != expected {
 		t.mutex.Unlock()
 		return ErrInvalidTunnelID
 	}
@@ -187,9 +257,28 @@ func (t *tunnels) Close(tunnelID uint64) error {
 	default:
 	}
 
-	close(tunnel.ToImplant)
-	close(tunnel.FromImplant)
+	tunnel.close()
 	return nil
+}
+
+// CloseForClient retires every tunnel bound to a specific client stream.
+func (t *tunnels) CloseForClient(stream rpcpb.SliverRPC_TunnelDataServer) []uint64 {
+	t.mutex.Lock()
+	tunnels := make([]*Tunnel, 0)
+	for _, tunnel := range t.tunnels {
+		if tunnel.ClientStream() == stream {
+			tunnels = append(tunnels, tunnel)
+		}
+	}
+	t.mutex.Unlock()
+
+	tunnelIDs := make([]uint64, 0, len(tunnels))
+	for _, tunnel := range tunnels {
+		if t.CloseTunnel(tunnel) == nil {
+			tunnelIDs = append(tunnelIDs, tunnel.ID)
+		}
+	}
+	return tunnelIDs
 }
 
 // Get - Get a tunnel

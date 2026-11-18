@@ -105,16 +105,12 @@ func auditLogSession(session *core.Session, register *sliverpb.Register) {
 	}
 }
 
-// The handler mutex prevents a send on a closed channel, without it
-// two handlers calls may race when a tunnel is quickly created and closed.
 func tunnelDataHandler(implantConn *core.ImplantConnection, data []byte) *sliverpb.Envelope {
 	session := core.Sessions.FromImplantConnection(implantConn)
 	if session == nil {
 		sessionHandlerLog.Warnf("Received tunnel data from unknown session: %v", implantConn)
 		return nil
 	}
-	tunnelHandlerMutex.Lock()
-	defer tunnelHandlerMutex.Unlock()
 	tunnelData := &sliverpb.TunnelData{}
 	proto.Unmarshal(data, tunnelData)
 
@@ -132,7 +128,9 @@ func tunnelDataHandler(implantConn *core.ImplantConnection, data []byte) *sliver
 		tunnel := core.Tunnels.Get(tunnelData.TunnelID)
 		if tunnel != nil {
 			if session.ID == tunnel.SessionID {
-				tunnel.SendDataFromImplant(tunnelData)
+				if err := tunnel.SendDataFromImplant(tunnelData); err != nil {
+					sessionHandlerLog.Debugf("Tunnel %d ended while delivering data: %s", tunnel.ID, err)
+				}
 			} else {
 				sessionHandlerLog.Warnf("Warning: Session %s attempted to send data on tunnel it did not own", session.ID)
 			}
@@ -150,9 +148,6 @@ func tunnelCloseHandler(implantConn *core.ImplantConnection, data []byte) *slive
 		sessionHandlerLog.Warnf("Received tunnel close from unknown session: %v", implantConn)
 		return nil
 	}
-	tunnelHandlerMutex.Lock()
-	defer tunnelHandlerMutex.Unlock()
-
 	tunnelData := &sliverpb.TunnelData{}
 	proto.Unmarshal(data, tunnelData)
 	sessionHandlerLog.Debugf("[CLOSE] Sequence on tunnel %d, %d, data: %s", tunnelData.TunnelID, tunnelData.Sequence, tunnelData.Data)
@@ -197,8 +192,6 @@ func socksDataHandler(implantConn *core.ImplantConnection, data []byte) *sliverp
 		sessionHandlerLog.Warnf("Received socks data from unknown session: %v", implantConn)
 		return nil
 	}
-	tunnelHandlerMutex.Lock()
-	defer tunnelHandlerMutex.Unlock()
 	socksData := &sliverpb.SocksData{}
 
 	proto.Unmarshal(data, socksData)
@@ -210,7 +203,9 @@ func socksDataHandler(implantConn *core.ImplantConnection, data []byte) *sliverp
 	socksTunnel := core.SocksTunnels.Get(socksData.TunnelID)
 	if socksTunnel != nil {
 		if session.ID == socksTunnel.SessionID {
-			socksTunnel.FromImplant <- socksData
+			if err := socksTunnel.SendDataFromImplant(socksData); err != nil {
+				sessionHandlerLog.Debugf("SOCKS tunnel %d ended while delivering data: %s", socksTunnel.ID, err)
+			}
 		} else {
 			sessionHandlerLog.Warnf("Warning: Session %s attempted to send data on tunnel it did not own", session.ID)
 		}

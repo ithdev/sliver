@@ -87,6 +87,13 @@ func (c *socksDataCache) DeleteSeq(tunnelID uint64, sequence uint64) {
 
 // Socks - Open an in-band port forward
 func (s *Server) SocksProxy(stream rpcpb.SliverRPC_SocksProxyServer) error {
+	defer func() {
+		for _, tunnelID := range core.SocksTunnels.CloseForClient(stream) {
+			toImplantCacheSocks.DeleteTun(tunnelID)
+			fromImplantCacheSocks.DeleteTun(tunnelID)
+		}
+	}()
+
 	for {
 		fromClient, err := stream.Recv()
 		if err == io.EOF {
@@ -103,21 +110,31 @@ func (s *Server) SocksProxy(stream rpcpb.SliverRPC_SocksProxyServer) error {
 		if socks == nil {
 			return nil
 		}
-		if socks.Client == nil {
-			socks.Client = stream // Bind client to tunnel
+		newBinding, owns := socks.BindClient(stream)
+		client := socks.ClientStream()
+		if newBinding {
 			// Send Client
 			go func() {
-				for tunnelData := range socks.FromImplant {
+				defer core.SocksTunnels.CloseTunnel(socks)
+				for {
+					var tunnelData *sliverpb.SocksData
+					select {
+					case <-socks.Done():
+						return
+					case tunnelData = <-socks.FromImplant:
+					}
 
 					fromImplantCacheSocks.Add(fromClient.TunnelID, tunnelData.Sequence, tunnelData)
 
 					for recv, ok := fromImplantCacheSocks.Get(fromClient.TunnelID, socks.FromImplantSequence); ok; recv, ok = fromImplantCacheSocks.Get(fromClient.TunnelID, socks.FromImplantSequence) {
 						rpcLog.Debugf("[socks] agent to (Server To Client)  Data Sequence %d , Data Size %d ,Data %v\n", socks.FromImplantSequence, len(recv.Data), recv.Data)
-						socks.Client.Send(&sliverpb.SocksData{
+						if err := client.Send(&sliverpb.SocksData{
 							CloseConn: recv.CloseConn,
 							TunnelID:  recv.TunnelID,
 							Data:      recv.Data,
-						})
+						}); err != nil {
+							return
+						}
 
 						fromImplantCacheSocks.DeleteSeq(fromClient.TunnelID, socks.FromImplantSequence)
 						socks.FromImplantSequence++
@@ -125,6 +142,9 @@ func (s *Server) SocksProxy(stream rpcpb.SliverRPC_SocksProxyServer) error {
 
 				}
 			}()
+		}
+		if !owns {
+			continue
 		}
 
 		// Send Agent
@@ -136,9 +156,13 @@ func (s *Server) SocksProxy(stream rpcpb.SliverRPC_SocksProxyServer) error {
 				data, _ := proto.Marshal(recv)
 
 				session := core.Sessions.Get(fromClient.Request.SessionID)
-				session.Connection.Send <- &sliverpb.Envelope{
+				select {
+				case session.Connection.Send <- &sliverpb.Envelope{
 					Type: sliverpb.MsgSocksData,
 					Data: data,
+				}:
+				case <-socks.Done():
+					return
 				}
 
 				toImplantCacheSocks.DeleteSeq(fromClient.TunnelID, socks.ToImplantSequence)

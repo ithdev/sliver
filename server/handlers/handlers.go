@@ -23,17 +23,11 @@ package handlers
 */
 
 import (
-	"sync"
-
 	"github.com/bishopfox/sliver/protobuf/sliverpb"
 	"github.com/bishopfox/sliver/server/core"
 )
 
 type ServerHandler func(*core.ImplantConnection, []byte) *sliverpb.Envelope
-
-var (
-	tunnelHandlerMutex = &sync.Mutex{}
-)
 
 // GetHandlers - Returns a map of server-side msg handlers
 func GetHandlers() map[uint32]ServerHandler {
